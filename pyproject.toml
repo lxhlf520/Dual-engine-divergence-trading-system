@@ -1,0 +1,27 @@
+[project]
+name = "dual-engine-divergence-trader"
+version = "1.0.0"
+description = "Dual-engine RSI divergence trading system for BTC perpetual swaps on OKX"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+readme = "README.md"
+
+dependencies = [
+    "pandas>=2.0.0",
+    "numpy>=1.24.0",
+    "requests>=2.31.0",
+    "python-dotenv>=1.0.0",
+    "matplotlib>=3.7.0",
+]
+
+[project.optional-dependencies]
+charts = ["matplotlib>=3.7.0"]
+dev = ["pytest>=7.0.0"]
+
+[project.scripts]
+live = "dual_engine_trader.live_runner:main"
+backtest = "dual_engine_trader.backtest.engine:main"
+download = "dual_engine_trader.data.downloader:main"
+
+[tool.uv]
+dev-dependencies = []
