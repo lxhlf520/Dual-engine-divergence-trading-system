@@ -1,0 +1,10 @@
+.env
+__pycache__/
+*.pyc
+logs/
+historical_data/
+live_output/
+backtest_output/
+.DS_Store
+config_proposed.json
+*.db
