@@ -12,8 +12,11 @@ from ..config import (
     BACKTEST_FEE_RATE,
     BACKTEST_SLIPPAGE_RATE,
     BACKTEST_PYRAMIDING,
+    DEFAULT_LEVERAGE,
+    BACKTEST_MAX_RISK_PCT,
+    BACKTEST_MAX_CAPITAL_PCT,
+    BACKTEST_MAX_CONTRACTS,
 )
-from ..strategy.detector import SignalType
 from ..strategy.engine import Direction
 
 
@@ -24,6 +27,9 @@ class Position:
     entry_price: float             # 入场价
     entry_ts: int                  # 入场时间戳 (ms)
     quantity: float                # 持仓数量（合约张数等价）
+    margin: float                  # 已锁定的保证金 = entry_price * quantity / leverage
+    entry_fee: float               # 开仓时已扣除的手续费
+    entry_slippage: float          # 开仓时已扣除的滑点
     trailing_sl: float             # 当前追踪止损价
     entry_bar_index: int           # 入场 K 线索引
     sl_log: List[float] = field(default_factory=list)  # 止损线历史
@@ -57,14 +63,16 @@ class EquityPoint:
 
 
 class VirtualAccount:
-    """虚拟账户——完全模拟实盘行为
+    """虚拟账户——永续合约仿真
 
-    核心规则（PRD 3.3）：
+    核心规则：
     - 初始资金 $10,000
+    - 开仓锁定保证金 = 名义价值 / 杠杆 (DEFAULT_LEVERAGE)
     - 单边手续费 0.05% (taker)
     - 1 bp 滑点磨损
     - pyramiding=2（同向最多 2 次加仓）
     - 做多止损只能上移，做空止损只能下移
+    - 总权益 = 可用资金 + 全部持仓保证金 + 浮动盈亏
     """
 
     def __init__(
@@ -73,12 +81,22 @@ class VirtualAccount:
         fee_rate: float = BACKTEST_FEE_RATE,
         slippage_rate: float = BACKTEST_SLIPPAGE_RATE,
         max_pyramiding: int = BACKTEST_PYRAMIDING,
+        leverage: int = DEFAULT_LEVERAGE,
+        contract_size: float = 0.01,   # BTC/USDT 永续合约每张 0.01 BTC
+        max_risk_pct: float = BACKTEST_MAX_RISK_PCT,
+        max_capital_pct: float = BACKTEST_MAX_CAPITAL_PCT,
+        max_contracts: float = BACKTEST_MAX_CONTRACTS,
     ):
         self.initial_capital = initial_capital
-        self.capital = initial_capital          # 当前可用资金
+        self.capital = initial_capital
         self.fee_rate = fee_rate
         self.slippage_rate = slippage_rate
         self.max_pyramiding = max_pyramiding
+        self.leverage = leverage
+        self.contract_size = contract_size
+        self.max_risk_pct = max_risk_pct
+        self.max_capital_pct = max_capital_pct
+        self.max_contracts = max_contracts
 
         # 持仓
         self.long_positions: List[Position] = []
@@ -86,7 +104,7 @@ class VirtualAccount:
 
         # 交易历史
         self.trades: List[Trade] = []
-        self.closed_trades: List[Trade] = []    # 已平仓
+        self.closed_trades: List[Trade] = []
 
         # 权益曲线
         self.equity_curve: List[EquityPoint] = []
@@ -101,17 +119,13 @@ class VirtualAccount:
     # ============================================================
     @property
     def total_equity(self) -> float:
-        """总权益 = 现金 + 持仓浮动盈亏"""
-        equity = self.capital
-        # 简化处理：回测中持仓按入场价计算占用保证金，浮动盈亏加到权益
-        # 实际 OKX 永续合约以 USDT 结算，这里用名义价值简化
-        for pos in self.long_positions + self.short_positions:
-            pass  # 浮动盈亏在平仓时结算
-        return equity
+        """总权益 = 可用资金 + 全部持仓的锁定保证金"""
+        locked_margin = sum(p.margin for p in self.long_positions + self.short_positions)
+        return self.capital + locked_margin
 
     def record_equity(self, timestamp: int) -> None:
         """记录当前权益快照"""
-        equity = self.capital
+        equity = self.total_equity
         drawdown = (self.peak_equity - equity) / self.peak_equity * 100 if self.peak_equity > 0 else 0
         if equity > self.peak_equity:
             self.peak_equity = equity
@@ -123,7 +137,38 @@ class VirtualAccount:
         ))
 
     # ============================================================
-    # 开仓
+    # 风险定仓
+    # ============================================================
+    def compute_contracts(self, price: float, stop_loss_price: float, equity: float = None) -> float:
+        """基于风控参数计算开仓张数（复制 OKX executor._compute_safe_contracts 逻辑）
+
+        约束：
+        - ct_by_risk: 单笔亏损不超过 equity × max_risk_pct%
+        - ct_by_margin: 占用保证金不超过 equity × max_capital_pct%
+        - ct_by_free: 不超过可用资金能覆盖的保证金
+        - max_contracts: 绝对上限
+
+        Returns: 合约张数，若 < 0.01 表示无法开仓
+        """
+        if stop_loss_price <= 0 or price <= 0:
+            return 0.0
+
+        eq = equity if equity is not None else self.total_equity
+        notional_per_ct = price * self.contract_size
+        margin_per_ct = notional_per_ct / self.leverage
+        sl_dist = abs(stop_loss_price - price) / price
+        risk_per_ct = notional_per_ct * sl_dist
+
+        ct_by_margin = (eq * self.max_capital_pct / 100) / margin_per_ct if margin_per_ct > 0 else 0
+        ct_by_risk = (eq * self.max_risk_pct / 100) / risk_per_ct if risk_per_ct > 0 else float('inf')
+        ct_by_free = self.capital / margin_per_ct if margin_per_ct > 0 else 0
+
+        raw_ct = min(ct_by_margin, ct_by_risk, ct_by_free, self.max_contracts)
+        sz = int(raw_ct * 100) / 100.0
+        return max(sz, 0.0)
+
+    # ============================================================
+    # 开仓（支持自动风险定仓）
     # ============================================================
     def open_position(
         self,
@@ -133,33 +178,43 @@ class VirtualAccount:
         bar_index: int,
         trailing_sl: float,
         divergence_type: str = "",
-        quantity: float = 1.0,     # 每笔固定 1 单位
+        quantity: Optional[float] = None,
     ) -> Optional[Position]:
-        """尝试开仓，返回 Position 或 None（余额不足/加仓上限）"""
+        """尝试开仓，返回 Position 或 None（余额不足/加仓上限）
+
+        若 quantity 为 None，通过 stop_loss_price=trailing_sl 自动定仓。
+        """
         # 检查 pyramiding 上限
         positions = self.long_positions if direction == Direction.LONG else self.short_positions
         if len(positions) >= self.max_pyramiding:
             return None
 
-        # 计算费用（市价单 taker fee + 滑点）
-        notional = price * quantity
+        # 自动定仓：基于止损距离计算合约数
+        if quantity is None:
+            quantity = self.compute_contracts(price, trailing_sl)
+            if quantity < 0.01:
+                return None
+
+        notional = price * quantity * self.contract_size
+        margin = notional / self.leverage
         fee = notional * self.fee_rate
         slippage = notional * self.slippage_rate
 
-        # 资金检查（考虑杠杆，回测中暂不模拟杠杆可用余额细节）
-        total_cost = fee + slippage
-        if self.capital < total_cost:
+        # 资金检查：可用资金要能覆盖保证金 + 费用
+        if self.capital < margin + fee + slippage:
             return None
 
-        # 扣费
-        self.capital -= total_cost
+        # 冻结保证金 + 扣费
+        self.capital -= (margin + fee + slippage)
 
-        # 创建持仓
         pos = Position(
             direction=direction,
             entry_price=price,
             entry_ts=timestamp,
             quantity=quantity,
+            margin=margin,
+            entry_fee=fee,
+            entry_slippage=slippage,
             trailing_sl=trailing_sl,
             entry_bar_index=bar_index,
             sl_log=[trailing_sl],
@@ -180,7 +235,14 @@ class VirtualAccount:
         bar_index: int,
         reason: str,
     ) -> Optional[Trade]:
-        """平掉最近一笔同向持仓，返回 Trade 记录"""
+        """平掉最近一笔同向持仓，返回 Trade 记录
+
+        真实永续合约逻辑：
+        - 释放保证金
+        - 计算盈亏：(exit_price - entry_price) * quantity * (±1)
+        - 扣除平仓费用和滑点
+        - 最终资金 = 原有可用 + 释放保证金 + 盈亏 - 平仓费用 - 滑点
+        """
         positions = self.long_positions if direction == Direction.LONG else self.short_positions
         if not positions:
             return None
@@ -188,25 +250,21 @@ class VirtualAccount:
         pos = positions.pop(0)  # FIFO 平仓
         bars_held = bar_index - pos.entry_bar_index
 
-        # 计算盈亏
-        notional = pos.entry_price * pos.quantity
-        exit_notional = price * pos.quantity
-
         if direction == Direction.LONG:
-            gross_pnl = (price - pos.entry_price) * pos.quantity
+            gross_pnl = (price - pos.entry_price) * pos.quantity * self.contract_size
         else:
-            gross_pnl = (pos.entry_price - price) * pos.quantity
+            gross_pnl = (pos.entry_price - price) * pos.quantity * self.contract_size
 
-        # 费用
-        entry_fee = notional * self.fee_rate
+        # 费用（平仓按 exit notional 算）
+        exit_notional = price * pos.quantity * self.contract_size
         exit_fee = exit_notional * self.fee_rate
-        slippage = notional * self.slippage_rate + exit_notional * self.slippage_rate
+        slippage = exit_notional * self.slippage_rate
 
-        net_pnl = gross_pnl - entry_fee - exit_fee - slippage
-        net_pnl_pct = (net_pnl / notional) * 100 if notional > 0 else 0
+        net_pnl = gross_pnl - exit_fee - slippage
+        net_pnl_pct = (net_pnl / pos.margin) * 100 if pos.margin > 0 else 0
 
-        # 结算
-        self.capital += exit_notional - exit_fee - slippage
+        # 资金结算：释放保证金 + 净盈亏 - 平仓费用
+        self.capital += pos.margin + net_pnl
 
         trade = Trade(
             direction=direction,
@@ -215,7 +273,7 @@ class VirtualAccount:
             entry_price=pos.entry_price,
             exit_price=price,
             quantity=pos.quantity,
-            entry_fee=entry_fee,
+            entry_fee=pos.entry_fee,
             exit_fee=exit_fee,
             slippage=slippage,
             net_pnl=net_pnl,
@@ -285,22 +343,20 @@ class VirtualAccount:
     def _force_close(self, pos: Position, exit_price: float,
                      timestamp: int, bar_index: int, reason: str) -> Trade:
         """内部强制平仓"""
-        notional = pos.entry_price * pos.quantity
-        exit_notional = exit_price * pos.quantity
+        exit_notional = exit_price * pos.quantity * self.contract_size
 
         if pos.direction == Direction.LONG:
-            gross_pnl = (exit_price - pos.entry_price) * pos.quantity
+            gross_pnl = (exit_price - pos.entry_price) * pos.quantity * self.contract_size
         else:
-            gross_pnl = (pos.entry_price - exit_price) * pos.quantity
+            gross_pnl = (pos.entry_price - exit_price) * pos.quantity * self.contract_size
 
-        entry_fee = notional * self.fee_rate
         exit_fee = exit_notional * self.fee_rate
-        slippage = (notional + exit_notional) * self.slippage_rate
+        slippage = exit_notional * self.slippage_rate
 
-        net_pnl = gross_pnl - entry_fee - exit_fee - slippage
-        net_pnl_pct = (net_pnl / notional) * 100 if notional > 0 else 0
+        net_pnl = gross_pnl - exit_fee - slippage
+        net_pnl_pct = (net_pnl / pos.margin) * 100 if pos.margin > 0 else 0
 
-        self.capital += exit_notional - exit_fee - slippage
+        self.capital += pos.margin + net_pnl
 
         trade = Trade(
             direction=pos.direction,
@@ -309,7 +365,7 @@ class VirtualAccount:
             entry_price=pos.entry_price,
             exit_price=exit_price,
             quantity=pos.quantity,
-            entry_fee=entry_fee,
+            entry_fee=pos.entry_fee,
             exit_fee=exit_fee,
             slippage=slippage,
             net_pnl=net_pnl,

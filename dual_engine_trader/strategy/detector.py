@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 from ..config import RSI_PERIOD, ATR_PERIOD, LB_L, LB_R
 from ..logger import get_logger
-from .indicators import compute_rsi, compute_atr, pivotlow, pivothigh
+from .indicators import compute_rsi, compute_atr, compute_adx, ema, pivotlow, pivothigh
 
 logger = get_logger(__name__)
 
@@ -54,6 +54,11 @@ class DivergenceParams:
     plot_bear: bool = True
     plot_hidden_bear: bool = True
     plot_bull: bool = True
+    # Trend filter: only take signals when ADX > threshold (0 = disabled)
+    adx_threshold: float = 0.0
+    adx_period: int = 14
+    # Trend direction filter: 0 = disabled, 1 = only in trend direction, -1 = only against
+    trend_filter: int = 0
 
 
 class DivergenceDetector:
@@ -74,6 +79,16 @@ class DivergenceDetector:
         rsi = compute_rsi(close, period=p.rsi_period)
         atr = compute_atr(high, low, close, period=p.atr_period)
 
+        # Trend filter (ADX)
+        adx = None
+        ema50 = None
+        ema200 = None
+        if p.adx_threshold > 0:
+            adx = compute_adx(high, low, close, period=p.adx_period)
+        if p.trend_filter != 0:
+            ema50 = ema(close, 50)
+            ema200 = ema(close, 200)
+
         ph = pivothigh(rsi, lbL=p.lb_l, lbR=p.lb_r)
         pl = pivotlow(rsi, lbL=p.lb_l, lbR=p.lb_r)
 
@@ -83,6 +98,21 @@ class DivergenceDetector:
         signals = []
         timestamps = df["timestamp"].astype(int).values
         scan_end = len(df) - 2  # exclude unclosed bar
+
+        def _passes_trend_filter(bar_idx: int, is_bullish: bool) -> bool:
+            """Check if signal passes ADX + trend direction filter."""
+            # ADX strength filter
+            if adx is not None and not pd.isna(adx.iloc[bar_idx]) and adx.iloc[bar_idx] < p.adx_threshold:
+                return False
+            # Trend direction filter
+            if p.trend_filter != 0 and ema50 is not None and ema200 is not None:
+                if not pd.isna(ema50.iloc[bar_idx]) and not pd.isna(ema200.iloc[bar_idx]):
+                    in_uptrend = ema50.iloc[bar_idx] > ema200.iloc[bar_idx]
+                    if p.trend_filter == 1 and not in_uptrend:
+                        return False  # only long signals in uptrend
+                    if p.trend_filter == -1 and in_uptrend:
+                        return False  # only short signals in downtrend
+            return True
 
         # ---- Bearish divergences (uses pivot highs) ----
         for idx_a, idx_b in zip(ph_bars, ph_bars[1:]):
@@ -102,6 +132,8 @@ class DivergenceDetector:
 
             # Regular bearish: price higher high, RSI lower high
             if p.plot_bear and rsi_b < rsi_a and high_shift_b > high_shift_a:
+                if not _passes_trend_filter(idx_b, is_bullish=False):
+                    continue
                 sl_price = float(high.iloc[idx_b]) + p.stop_loss_mult * float(atr.iloc[idx_b])
                 signals.append(Signal(
                     timestamp=int(timestamps[idx_b]), timeframe=timeframe,
@@ -113,6 +145,8 @@ class DivergenceDetector:
 
             # Hidden bearish: price lower high, RSI higher high
             if p.plot_hidden_bear and rsi_b > rsi_a and high_shift_b < high_shift_a:
+                if not _passes_trend_filter(idx_b, is_bullish=False):
+                    continue
                 sl_price = float(high.iloc[idx_b]) + p.stop_loss_mult * float(atr.iloc[idx_b])
                 signals.append(Signal(
                     timestamp=int(timestamps[idx_b]), timeframe=timeframe,
@@ -140,6 +174,8 @@ class DivergenceDetector:
 
             # Regular bullish: price lower low, RSI higher low
             if p.plot_bull and rsi_b > rsi_a and low_shift_b < low_shift_a:
+                if not _passes_trend_filter(idx_b, is_bullish=True):
+                    continue
                 sl_price = float(low.iloc[idx_b]) - p.stop_loss_mult * float(atr.iloc[idx_b])
                 signals.append(Signal(
                     timestamp=int(timestamps[idx_b]), timeframe=timeframe,
@@ -151,6 +187,8 @@ class DivergenceDetector:
 
             # Hidden bullish: price higher low, RSI lower low
             if p.plot_bull and rsi_b < rsi_a and low_shift_b > low_shift_a:
+                if not _passes_trend_filter(idx_b, is_bullish=True):
+                    continue
                 sl_price = float(low.iloc[idx_b]) - p.stop_loss_mult * float(atr.iloc[idx_b])
                 signals.append(Signal(
                     timestamp=int(timestamps[idx_b]), timeframe=timeframe,

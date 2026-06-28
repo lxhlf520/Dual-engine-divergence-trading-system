@@ -119,3 +119,35 @@ def barssince(condition: pd.Series) -> pd.Series:
         elif last_true is not None:
             result.loc[idx] = condition.index.get_loc(idx) - condition.index.get_loc(last_true)
     return result
+
+
+def compute_adx(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
+    """Average Directional Index — trend strength indicator (0-100).
+
+    ADX > 25: strong trend. ADX < 20: weak/choppy.
+    """
+    up = high.diff()
+    down = -low.diff()
+    plus_dm = pd.Series(0.0, index=close.index)
+    minus_dm = pd.Series(0.0, index=close.index)
+    plus_dm[(up > down) & (up > 0)] = up[(up > down) & (up > 0)]
+    minus_dm[(down > up) & (down > 0)] = down[(down > up) & (down > 0)]
+
+    tr = pd.concat([
+        high - low,
+        (high - close.shift()).abs(),
+        (low - close.shift()).abs(),
+    ], axis=1).max(axis=1)
+
+    atr = tr.ewm(alpha=1/period, min_periods=period).mean()
+    plus_di = 100 * plus_dm.ewm(alpha=1/period, min_periods=period).mean() / atr.replace(0, np.nan)
+    minus_di = 100 * minus_dm.ewm(alpha=1/period, min_periods=period).mean() / atr.replace(0, np.nan)
+
+    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
+    adx = dx.ewm(alpha=1/period, min_periods=period).mean()
+    return adx.clip(0, 100)
+
+
+def ema(series: pd.Series, period: int) -> pd.Series:
+    """Exponential Moving Average (Pine Script compatible)."""
+    return series.ewm(span=period, adjust=False).mean()

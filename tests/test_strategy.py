@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 
 from dual_engine_trader.strategy.indicators import (
-    compute_rsi, compute_atr, pivotlow, pivothigh, valuewhen, barssince,
+    compute_rsi, compute_atr, compute_adx, ema, pivotlow, pivothigh, valuewhen, barssince,
 )
 from dual_engine_trader.strategy.detector import (
     DivergenceDetector, DivergenceParams, SignalType,
@@ -120,6 +120,99 @@ def test_stop_trigger():
     assert not u.check_short_stop(close=114, trailing_sl=115)
     print("  Stop trigger: PASS")
 
+def test_adx_calculation():
+    n = 200
+    rng = np.random.default_rng(42)
+    close = pd.Series(50000 + rng.normal(0, 200, n).cumsum())
+    high = close + np.abs(rng.normal(0, 150, n))
+    low = close - np.abs(rng.normal(0, 150, n))
+    adx = compute_adx(high, low, close, period=14)
+    valid = adx.dropna()
+    assert len(valid) > 0
+    assert valid.min() >= 0
+    assert valid.max() <= 100
+    print(f"  ADX: PASS (mean={valid.mean():.1f})")
+
+def test_ema_calculation():
+    s = pd.Series([1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
+    e = ema(s, period=3)
+    valid = e.dropna()
+    assert len(valid) > 0
+    assert not np.isnan(e.iloc[-1])
+    print(f"  EMA: PASS (last={e.iloc[-1]:.2f})")
+
+def test_adx_trend_filter():
+    """Verify that ADX threshold in DivergenceParams filters signals."""
+    from dual_engine_trader.strategy.detector import DivergenceParams
+    df = create_synthetic_klines(n=500, seed=42)
+    params_no_filter = DivergenceParams(adx_threshold=0.0)
+    params_filtered = DivergenceParams(adx_threshold=50.0)  # very high threshold
+    sigs_all = DivergenceDetector(params_no_filter).detect(df, "15m")
+    sigs_filtered = DivergenceDetector(params_filtered).detect(df, "15m")
+    assert len(sigs_filtered) <= len(sigs_all)
+    print(f"  ADX filter: PASS (unfiltered={len(sigs_all)}, filtered={len(sigs_filtered)})")
+
+def test_virtual_account_accounting():
+    """Verify VirtualAccount margin accounting is correct."""
+    from dual_engine_trader.backtest.account import VirtualAccount
+    from dual_engine_trader.strategy.engine import Direction
+    acct = VirtualAccount(initial_capital=10000, leverage=10, contract_size=1.0,
+                          max_contracts=100)  # lift cap so compute_contracts doesn't interfere
+    # Pass quantity explicitly to test pure accounting, not risk sizing
+    pos = acct.open_position(direction=Direction.SHORT, price=50000, timestamp=0,
+                             bar_index=0, trailing_sl=51000, quantity=1.0)
+    assert pos is not None
+    expected_margin = 50000 / 10  # 5000
+    assert abs(pos.margin - expected_margin) < 0.01
+    fees_slip = 50000 * (0.0005 + 0.0001)
+    expected_capital = 10000 - expected_margin - fees_slip
+    assert abs(acct.capital - expected_capital) < 0.01
+    trade = acct.close_position(direction=Direction.SHORT, price=49000, timestamp=100, bar_index=1, reason="TP")
+    assert trade is not None
+    assert trade.net_pnl > 0
+    print(f"  VirtualAccount accounting: PASS (margin={pos.margin:.2f}, capital={acct.capital:.2f}, pnl={trade.net_pnl:.2f})")
+
+def test_virtual_account_pyramiding():
+    """Verify pyramiding limit works."""
+    from dual_engine_trader.backtest.account import VirtualAccount
+    from dual_engine_trader.strategy.engine import Direction
+    price = 50000
+    margin = price / 10  # leverage 10x
+    fee_slip = price * (0.0005 + 0.0001)
+    needed = margin + fee_slip
+    acct = VirtualAccount(initial_capital=needed * 3 + 100, leverage=10, max_pyramiding=2,
+                          contract_size=1.0, max_contracts=100)
+    p1 = acct.open_position(direction=Direction.LONG, price=price, timestamp=0,
+                             bar_index=0, trailing_sl=48000, quantity=1.0)
+    assert p1 is not None
+    p2 = acct.open_position(direction=Direction.LONG, price=price, timestamp=100,
+                             bar_index=1, trailing_sl=48100, quantity=1.0)
+    assert p2 is not None
+    p3 = acct.open_position(direction=Direction.LONG, price=price, timestamp=200,
+                             bar_index=2, trailing_sl=48200, quantity=1.0)
+    assert p3 is None  # pyramiding limit reached
+    print("  VirtualAccount pyramiding: PASS")
+
+def test_virtual_account_risk_sizing():
+    """Verify risk-based position sizing works correctly."""
+    from dual_engine_trader.backtest.account import VirtualAccount
+    from dual_engine_trader.strategy.engine import Direction
+    # $10k capital, 2x leverage, 15% max risk per trade
+    acct = VirtualAccount(initial_capital=10000, leverage=2, contract_size=0.01,
+                          max_risk_pct=15.0, max_capital_pct=70.0, max_contracts=5)
+    # Tight SL (2% away) -> many contracts
+    ct = acct.compute_contracts(price=50000, stop_loss_price=51000)
+    assert ct > 0, f"Expected contracts > 0, got {ct}"
+    assert ct <= 5, f"Should be capped at max_contracts=5, got {ct}"
+    # Wide SL (50% away) -> risk cap limits contracts
+    ct2 = acct.compute_contracts(price=50000, stop_loss_price=75000)
+    assert ct2 >= 0 and ct2 <= ct, f"Wider SL should give fewer contracts: {ct2} vs {ct}"
+    # Open with wide SL should succeed
+    pos = acct.open_position(direction=Direction.SHORT, price=50000, timestamp=0,
+                             bar_index=0, trailing_sl=51000)
+    assert pos is not None
+    print(f"  Risk sizing: PASS (tight_sl={ct:.2f}, wide_sl={ct2:.2f}, opened_qty={pos.quantity})")
+
 if __name__ == "__main__":
     print("=" * 60)
     print("Strategy Module Unit Tests")
@@ -130,6 +223,12 @@ if __name__ == "__main__":
     test_valuewhen()
     test_trailing_stop()
     test_stop_trigger()
+    test_adx_calculation()
+    test_ema_calculation()
+    test_adx_trend_filter()
+    test_virtual_account_accounting()
+    test_virtual_account_pyramiding()
+    test_virtual_account_risk_sizing()
     test_divergence_signals()
     test_multiframe_separation()
     print("\n" + "=" * 60)

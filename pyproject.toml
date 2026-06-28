@@ -12,6 +12,8 @@ dependencies = [
     "requests>=2.31.0",
     "python-dotenv>=1.0.0",
     "matplotlib>=3.7.0",
+    "ccxt>=4.2.0",
+    "ccxt-pro>=4.2.0",
 ]
 
 [project.optional-dependencies]

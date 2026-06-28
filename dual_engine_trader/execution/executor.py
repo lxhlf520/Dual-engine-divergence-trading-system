@@ -22,7 +22,8 @@ def _sign(ts, method, path, body=""):
     return base64.b64encode(hmac.new(API_SECRET.encode(), (ts+method+path+body).encode(), hashlib.sha256).digest()).decode()
 
 def _headers(method, path, body=""):
-    ts = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.') + str(int(datetime.now(timezone.utc).microsecond / 1000)).zfill(3) + 'Z'
+    now = datetime.now(timezone.utc)
+    ts = now.strftime('%Y-%m-%dT%H:%M:%S.') + str(int(now.microsecond / 1000)).zfill(3) + 'Z'
     return {"OK-ACCESS-KEY": API_KEY, "OK-ACCESS-SIGN": _sign(ts, method, path, body), "OK-ACCESS-TIMESTAMP": ts, "OK-ACCESS-PASSPHRASE": API_PASSWORD, "Content-Type": "application/json"}
 
 def okx_get(path, params=None):

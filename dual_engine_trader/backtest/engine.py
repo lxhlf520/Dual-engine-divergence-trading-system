@@ -7,9 +7,9 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from ..config import BACKTEST_INITIAL_CAPITAL, BACKTEST_FEE_RATE, BACKTEST_SLIPPAGE_RATE, BACKTEST_PYRAMIDING
-from ..strategy.detector import DivergenceDetector, DivergenceParams, TrailingStopUpdater, Signal, SignalType, DivergenceType
+from ..strategy.detector import DivergenceDetector, TrailingStopUpdater, Signal, SignalType
 from ..strategy.engine import Direction, LONG_PARAMS, SHORT_PARAMS
-from ..strategy.indicators import compute_rsi, compute_atr, pivotlow, pivothigh, valuewhen, barssince
+from ..strategy.indicators import compute_atr
 from ..logger import get_logger
 from .account import VirtualAccount, Trade, Position
 
@@ -53,119 +53,144 @@ class BacktestEngine:
         logger.info("Backtest starting...")
         logger.info("  Initial capital: ${:,.2f}".format(self.initial_capital))
         logger.info("=" * 60)
-        if self.df_15m is not None:
-            self._run_on_timeframe(self.df_15m, "15m", self.short_detector, self.short_sl_updater, warmup_bars)
-        if self.df_2h is not None:
+
+        if self.df_15m is None:
+            # Only 2H data — run standalone
             self._run_on_timeframe(self.df_2h, "2h", self.long_detector, self.long_sl_updater, warmup_bars)
-        logger.info("=" * 60)
-        logger.info("Backtest complete")
-        logger.info("=" * 60)
-        return self.generate_report()
+            logger.info("=" * 60)
+            logger.info("Backtest complete")
+            logger.info("=" * 60)
+            return self.generate_report()
 
-    def _run_on_timeframe(self, df, timeframe, detector, sl_updater, warmup_bars):
-        n = len(df)
-        if n < warmup_bars + 20:
-            logger.warning("[{}] Insufficient bars: {}".format(timeframe, n))
-            return
+        # Use 15M as the unified timeline
+        df_15m = self.df_15m
+        n = len(df_15m)
+        warmup_15m = max(warmup_bars, 80)
 
-        direction = Direction.LONG if timeframe == "2h" else Direction.SHORT
-        is_long = direction == Direction.LONG
-        allowed_open = {SignalType.BUY} if is_long else {SignalType.SELL}
-        allowed_close = {SignalType.CLOSE_LONG} if is_long else {SignalType.CLOSE_SHORT}
+        # Pre-compute signals for both engines
+        short_signals = self.short_detector.detect(df_15m, "15m")
+        sigs_by_bar = self._index_signals(short_signals, df_15m)
 
-        # Pre-compute all signals ONCE using the improved detector
-        all_signals = detector.detect(df, timeframe)
+        long_signals = []
+        if self.df_2h is not None:
+            long_signals = self.long_detector.detect(self.df_2h, "2h")
+            # Map 2H signals to the last 15M bar in each 2H period
+            sigs_by_bar = self._merge_2h_signals(long_signals, self.df_2h, df_15m, sigs_by_bar)
 
-        # Index signals by bar index for O(1) lookup
-        sigs_by_bar = {}
-        for sig in all_signals:
-            meta = sig.metadata
-            bar_idx = meta.get("pivot_b") if sig.signal_type in (SignalType.BUY, SignalType.SELL) else None
-            if bar_idx is not None:
-                sigs_by_bar.setdefault(bar_idx, []).append(sig)
-        # Also index take-profit signals
-        for sig in all_signals:
-            if sig.signal_type in (SignalType.CLOSE_LONG, SignalType.CLOSE_SHORT):
-                # Find bar index closest to signal timestamp
-                ts_diffs = (df["timestamp"].astype(int) - sig.timestamp).abs()
-                if ts_diffs.min() == 0:
-                    bar_idx = ts_diffs.idxmin()
-                    sigs_by_bar.setdefault(bar_idx, []).append(sig)
-
-        p = detector.params
         account = self.account
-        timestamps = df["timestamp"].astype(int).values
 
-        for i in range(warmup_bars + 20, n):
-            bar = df.iloc[i]
+        # Pre-compute 15M ATR for stop updates
+        atr_series_15m = compute_atr(
+            df_15m["high"].astype(float), df_15m["low"].astype(float),
+            df_15m["close"].astype(float), period=14,
+        )
+
+        for i in range(warmup_15m, n):
+            bar = df_15m.iloc[i]
             bar_ts = int(bar["timestamp"])
             bar_high = float(bar["high"])
             bar_low = float(bar["low"])
             bar_close = float(bar["close"])
-            # We need current ATR for stop updates; approximate from pre-computed
-            current_atr_val = 0.0
+            current_atr_val = float(atr_series_15m.iloc[i]) if not pd.isna(atr_series_15m.iloc[i]) else 0.0
 
             if i % 10 == 0:
                 account.record_equity(bar_ts)
 
-            # Update stops
-            if is_long:
-                for pi in range(len(account.long_positions)):
-                    pos = account.long_positions[pi]
-                    new_sl = sl_updater.update_long_sl(pos.trailing_sl, bar_low, current_atr_val)
-                    account.update_trailing_sl_long(new_sl, pi)
-                closed = account.check_long_stops(bar_low, bar_high, bar_ts, i)
-                for trade in closed:
-                    self.events_log.append({"bar": i, "ts": bar_ts, "event": "stop", "direction": "LONG", "price": trade.exit_price, "pnl": trade.net_pnl, "reason": "TSL_STOP"})
-            else:
-                for pi in range(len(account.short_positions)):
-                    pos = account.short_positions[pi]
-                    new_sl = sl_updater.update_short_sl(pos.trailing_sl, bar_high, current_atr_val)
-                    account.update_trailing_sl_short(new_sl, pi)
-                closed = account.check_short_stops(bar_low, bar_high, bar_ts, i)
-                for trade in closed:
-                    self.events_log.append({"bar": i, "ts": bar_ts, "event": "stop", "direction": "SHORT", "price": trade.exit_price, "pnl": trade.net_pnl, "reason": "TSL_STOP"})
+            # ---- 1. Update trailing stops for both directions ----
+            for pi in range(len(account.long_positions)):
+                pos = account.long_positions[pi]
+                new_sl = self.long_sl_updater.update_long_sl(pos.trailing_sl, bar_low, current_atr_val)
+                account.update_trailing_sl_long(new_sl, pi)
 
-            # Process pre-computed signals at this bar
+            for pi in range(len(account.short_positions)):
+                pos = account.short_positions[pi]
+                new_sl = self.short_sl_updater.update_short_sl(pos.trailing_sl, bar_high, current_atr_val)
+                account.update_trailing_sl_short(new_sl, pi)
+
+            # ---- 2. Check stop-losses ----
+            closed_long = account.check_long_stops(bar_low, bar_high, bar_ts, i)
+            for trade in closed_long:
+                self.events_log.append({"bar": i, "ts": bar_ts, "event": "stop", "direction": "LONG", "price": trade.exit_price, "pnl": trade.net_pnl, "reason": "TSL_STOP"})
+
+            closed_short = account.check_short_stops(bar_low, bar_high, bar_ts, i)
+            for trade in closed_short:
+                self.events_log.append({"bar": i, "ts": bar_ts, "event": "stop", "direction": "SHORT", "price": trade.exit_price, "pnl": trade.net_pnl, "reason": "TSL_STOP"})
+
+            # ---- 3. Process signals ----
             if i in sigs_by_bar:
                 for sig in sigs_by_bar[i]:
-                    self.signals_log.append({"timestamp": sig.timestamp, "timeframe": timeframe, "signal_type": sig.signal_type.value, "divergence_type": sig.divergence_type.value if sig.divergence_type else "", "price": sig.price})
-                    if sig.signal_type in allowed_open:
-                        pos = account.open_position(direction=direction, price=bar_close, timestamp=bar_ts, bar_index=i, trailing_sl=sig.trailing_sl or 0.0, divergence_type=sig.divergence_type.value if sig.divergence_type else "")
+                    self.signals_log.append({
+                        "timestamp": sig.timestamp, "timeframe": sig.timeframe,
+                        "signal_type": sig.signal_type.value,
+                        "divergence_type": sig.divergence_type.value if sig.divergence_type else "",
+                        "price": sig.price,
+                    })
+                    if sig.signal_type == SignalType.BUY:
+                        pos = account.open_position(
+                            direction=Direction.LONG, price=bar_close, timestamp=bar_ts,
+                            bar_index=i, trailing_sl=sig.trailing_sl or 0.0,
+                            divergence_type=sig.divergence_type.value if sig.divergence_type else "",
+                        )
                         if pos:
-                            self.events_log.append({"bar": i, "ts": bar_ts, "event": "open", "direction": direction.value, "price": bar_close, "sl": sig.trailing_sl})
-                    elif sig.signal_type in allowed_close:
-                        positions = account.long_positions if is_long else account.short_positions
-                        while positions:
-                            trade = account.close_position(direction=direction, price=bar_close, timestamp=bar_ts, bar_index=i, reason="SIGNAL_{}".format(sig.signal_type.value))
+                            self.events_log.append({"bar": i, "ts": bar_ts, "event": "open", "direction": "LONG", "price": bar_close, "sl": sig.trailing_sl})
+                    elif sig.signal_type == SignalType.SELL:
+                        pos = account.open_position(
+                            direction=Direction.SHORT, price=bar_close, timestamp=bar_ts,
+                            bar_index=i, trailing_sl=sig.trailing_sl or 0.0,
+                            divergence_type=sig.divergence_type.value if sig.divergence_type else "",
+                        )
+                        if pos:
+                            self.events_log.append({"bar": i, "ts": bar_ts, "event": "open", "direction": "SHORT", "price": bar_close, "sl": sig.trailing_sl})
+                    elif sig.signal_type == SignalType.CLOSE_LONG:
+                        while account.long_positions:
+                            trade = account.close_position(direction=Direction.LONG, price=bar_close, timestamp=bar_ts, bar_index=i, reason="SIGNAL_CLOSE_LONG")
                             if trade:
-                                self.events_log.append({"bar": i, "ts": bar_ts, "event": "close", "direction": direction.value, "price": bar_close, "pnl": trade.net_pnl, "reason": trade.exit_reason})
-        # Force close remaining
-        if not df.empty:
-            last_bar = df.iloc[-1]
-            last_ts = int(last_bar["timestamp"])
-            last_close = float(last_bar["close"])
-            positions = account.long_positions if is_long else account.short_positions
-            while positions:
-                account.close_position(direction=direction, price=last_close, timestamp=last_ts, bar_index=n-1, reason="EOD_FORCE_CLOSE")
+                                self.events_log.append({"bar": i, "ts": bar_ts, "event": "close", "direction": "LONG", "price": bar_close, "pnl": trade.net_pnl, "reason": trade.exit_reason})
+                    elif sig.signal_type == SignalType.CLOSE_SHORT:
+                        while account.short_positions:
+                            trade = account.close_position(direction=Direction.SHORT, price=bar_close, timestamp=bar_ts, bar_index=i, reason="SIGNAL_CLOSE_SHORT")
+                            if trade:
+                                self.events_log.append({"bar": i, "ts": bar_ts, "event": "close", "direction": "SHORT", "price": bar_close, "pnl": trade.net_pnl, "reason": trade.exit_reason})
 
-    def _update_and_check_stops(self, bar_low, bar_high, bar_close, bar_ts, bar_index, is_long, sl_updater, current_atr):
-        if is_long:
-            for idx in range(len(self.account.long_positions)):
-                pos = self.account.long_positions[idx]
-                new_sl = sl_updater.update_long_sl(pos.trailing_sl, bar_low, current_atr)
-                self.account.update_trailing_sl_long(new_sl, idx)
-            closed = self.account.check_long_stops(bar_low, bar_high, bar_ts, bar_index)
-            for trade in closed:
-                self.events_log.append({"bar": bar_index, "ts": bar_ts, "event": "stop", "direction": "LONG", "price": trade.exit_price, "pnl": trade.net_pnl, "reason": "TSL_STOP"})
-        else:
-            for idx in range(len(self.account.short_positions)):
-                pos = self.account.short_positions[idx]
-                new_sl = sl_updater.update_short_sl(pos.trailing_sl, bar_high, current_atr)
-                self.account.update_trailing_sl_short(new_sl, idx)
-            closed = self.account.check_short_stops(bar_low, bar_high, bar_ts, bar_index)
-            for trade in closed:
-                self.events_log.append({"bar": bar_index, "ts": bar_ts, "event": "stop", "direction": "SHORT", "price": trade.exit_price, "pnl": trade.net_pnl, "reason": "TSL_STOP"})
+        # Force close remaining positions
+        last_close = float(df_15m["close"].iloc[-1])
+        while account.long_positions:
+            account.close_position(direction=Direction.LONG, price=last_close, timestamp=int(df_15m["timestamp"].iloc[-1]), bar_index=n-1, reason="EOD_FORCE_CLOSE")
+        while account.short_positions:
+            account.close_position(direction=Direction.SHORT, price=last_close, timestamp=int(df_15m["timestamp"].iloc[-1]), bar_index=n-1, reason="EOD_FORCE_CLOSE")
+
+        logger.info("=" * 60)
+        logger.info("Backtest complete (combined timeline)")
+        logger.info("=" * 60)
+        return self.generate_report()
+
+    def _index_signals(self, signals, df):
+        """Index signals by bar index for O(1) lookup."""
+        sigs_by_bar = {}
+        for sig in signals:
+            meta = sig.metadata
+            bar_idx = meta.get("pivot_b") if sig.signal_type in (SignalType.BUY, SignalType.SELL) else None
+            if bar_idx is not None:
+                sigs_by_bar.setdefault(bar_idx, []).append(sig)
+        for sig in signals:
+            if sig.signal_type in (SignalType.CLOSE_LONG, SignalType.CLOSE_SHORT):
+                ts_diffs = (df["timestamp"].astype(int) - sig.timestamp).abs()
+                if ts_diffs.min() == 0:
+                    bar_idx = ts_diffs.idxmin()
+                    sigs_by_bar.setdefault(bar_idx, []).append(sig)
+        return sigs_by_bar
+
+    def _merge_2h_signals(self, long_signals, df_2h, df_15m, sigs_by_bar):
+        """Map 2H signals to the corresponding 15M bar timestamp."""
+        # Build a map: 2H bar timestamp -> list of signals
+        for sig in long_signals:
+            sig_ts = sig.timestamp
+            # Find the nearest 15M bar (should be exact or the last in that 2H period)
+            ts_diffs = (df_15m["timestamp"].astype(int) - sig_ts).abs()
+            nearest_idx = ts_diffs.idxmin()
+            if ts_diffs.min() <= 7200000:  # within 2 hours = one 2H bar
+                sigs_by_bar.setdefault(nearest_idx, []).append(sig)
+        return sigs_by_bar
 
     def generate_report(self):
         trades = self.account.closed_trades
