@@ -2,7 +2,7 @@ import json, time, base64, hmac, hashlib, urllib.parse
 from datetime import datetime, timezone
 from typing import Optional, Dict, Tuple
 import requests
-from ..config import SYMBOL, DEFAULT_LEVERAGE, MARGIN_MODE, API_KEY, API_SECRET, API_PASSWORD, HTTP_PROXY, HTTPS_PROXY
+from ..config import SYMBOL, DEFAULT_LEVERAGE, MARGIN_MODE, API_KEY, API_SECRET, API_PASSWORD, HTTP_PROXY, HTTPS_PROXY, LIVE_PYRAMIDING
 from ..logger import get_logger
 from .alerts import AlertManager
 
@@ -40,10 +40,11 @@ def okx_post(path, body):
     return r.json()
 
 class OKXExecution:
-    def __init__(self, alert=None, max_risk_pct=15.0, max_capital_pct=70.0, max_contracts=5):
+    def __init__(self, alert=None, max_risk_pct=15.0, max_capital_pct=70.0, max_contracts=5,
+                 leverage=None):
         self.alert = alert or AlertManager()
         self._last_sl_order_id = None
-        self._leverage = DEFAULT_LEVERAGE
+        self._leverage = leverage if leverage is not None else DEFAULT_LEVERAGE
         self.max_risk_pct = max_risk_pct
         self.max_capital_pct = max_capital_pct
         self.max_contracts = max_contracts
@@ -121,7 +122,22 @@ class OKXExecution:
             if ticker.get("code") != "0":
                 return False, "Ticker failed", {}
             price = float(ticker["data"][0]["last"])
+
+            # 检查现有持仓，如果是加仓场景则增量开仓
+            existing_pos = self.get_position()
+            existing_ct = int(float(existing_pos["contracts"])) if existing_pos and existing_pos["side"] == "short" else 0
+            total_max = int(self.max_contracts * LIVE_PYRAMIDING) if hasattr(self, 'max_contracts') else self.max_contracts
+
+            # 计算单笔开仓量（不超过 pyramiding 上限）
+            margin_budget = self.get_balance()["total_equity"] * (self.max_capital_pct / 100 if hasattr(self, 'max_capital_pct') else 0.5)
+            # 这一笔最大能开多少（考虑已持仓）
+            allowed_new = max(0, int(total_max) - existing_ct)
+            if allowed_new == 0:
+                return False, "BLOCKED: pyramiding limit", {}
+
+            # 按风险计算可开张数（单笔）
             contracts, srep = self._compute_safe_contracts(price, stop_loss_price)
+            contracts = min(contracts, float(allowed_new))
             if contracts == 0:
                 msg = "BLOCKED: {}".format(srep.get("block_reason", "margin"))
                 logger.warning(msg)
@@ -129,14 +145,15 @@ class OKXExecution:
                 return False, msg, srep
             self.set_leverage(self._leverage)
             sz = self._ct_to_sz(contracts)
-            logger.info("SHORT {}ct sz={} @ ~{:.0f} SL={:.0f} Risk=${:.0f}".format(contracts, sz, price, stop_loss_price, srep.get("risk_per_ct", 0)))
+            logger.info("SHORT {}ct sz={} @ ~{:.0f} SL={:.0f} (existing={} total={})".format(
+                contracts, sz, price, stop_loss_price, existing_ct, existing_ct + contracts))
             order = okx_post("/api/v5/trade/order", {"instId": INST_ID, "tdMode": "cross", "posSide": "short", "side": "sell", "ordType": "market", "sz": sz})
             if order.get("code") != "0":
                 return False, "Order failed: {}".format(order.get("msg")), srep
-            sl_id = self._place_stop_loss("buy", contracts, stop_loss_price)
+            sl_id = self._place_stop_loss("buy", existing_ct + contracts, stop_loss_price)
             if sl_id:
                 self._last_sl_order_id = sl_id
-            return True, "Short {}ct SL={:.0f}".format(contracts, stop_loss_price), srep
+            return True, "Short {}ct (+{}pyra) SL={:.0f}".format(existing_ct + contracts, contracts, stop_loss_price), srep
         except Exception as e:
             logger.error("open_short: {}".format(e))
             return False, str(e), {}

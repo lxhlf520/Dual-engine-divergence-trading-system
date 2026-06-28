@@ -1,6 +1,6 @@
 import sys, warnings, os, json, time, threading
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date
 from collections import defaultdict
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -14,7 +14,12 @@ from dual_engine_trader.strategy.detector import DivergenceDetector, DivergenceP
 from dual_engine_trader.strategy.engine import Direction, LONG_PARAMS, SHORT_PARAMS
 from dual_engine_trader.strategy.indicators import compute_rsi, compute_atr, pivotlow, pivothigh
 from dual_engine_trader.execution.executor import OKXExecution, INST_ID
-from dual_engine_trader.config import HTTP_PROXY, HTTPS_PROXY, TIMEFRAMES
+from dual_engine_trader.config import (
+    HTTP_PROXY, HTTPS_PROXY, TIMEFRAMES,
+    LIVE_CAPITAL, DEFAULT_LEVERAGE,
+    LIVE_MAX_RISK_PCT, LIVE_MAX_CAPITAL_PCT, LIVE_MAX_CONTRACTS,
+    DAILY_DD_LIMIT, CUMULATIVE_DD_REDUCE, CUMULATIVE_DD_STOP,
+)
 from dual_engine_trader.logger import setup_logger
 
 logger = setup_logger("live_runner")
@@ -32,21 +37,41 @@ if HTTP_PROXY or HTTPS_PROXY:
 
 CANDLE_LIMITS = {"15m": 500, "2h": 200}
 
-class LiveRunner:
-    def __init__(self, capital=50.0, leverage=2, max_risk_pct=15.0, max_capital_pct=70.0, max_contracts=5):
-        self.capital = capital
-        self.leverage = leverage
 
-        # 双引擎检测器
+class LiveRunner:
+    """实盘运行器 — 500U 5x 激进方案
+
+    核心参数：
+       首笔 2 张 → 加仓 2 张 = 最多 4 张
+       ATR(14) 止损距离，盈亏比 1.67
+
+    安全熔断：
+       - 当日回撤 >10%    → 暂停当天交易
+       - 累计回撤 >25%    → 降为 1 张模式
+       - 累计回撤 >40%    → 全部平仓停止
+    """
+
+    def __init__(self, capital=None, leverage=None, max_risk_pct=None,
+                 max_capital_pct=None, max_contracts=None):
+        self.capital = capital if capital is not None else LIVE_CAPITAL
+        self.leverage = leverage if leverage is not None else DEFAULT_LEVERAGE
+        self.max_risk_pct = max_risk_pct if max_risk_pct is not None else LIVE_MAX_RISK_PCT
+        self.max_capital_pct = max_capital_pct if max_capital_pct is not None else LIVE_MAX_CAPITAL_PCT
+        self.max_contracts = max_contracts if max_contracts is not None else LIVE_MAX_CONTRACTS
+
         self.short_detector = DivergenceDetector(SHORT_PARAMS)
         self.long_detector = DivergenceDetector(LONG_PARAMS)
         self.short_sl_updater = TrailingStopUpdater(stop_loss_mult=SHORT_PARAMS.stop_loss_mult)
         self.long_sl_updater = TrailingStopUpdater(stop_loss_mult=LONG_PARAMS.stop_loss_mult)
 
-        self.executor = OKXExecution(max_risk_pct=max_risk_pct, max_capital_pct=max_capital_pct, max_contracts=max_contracts)
-        self.executor._leverage = leverage
+        self.executor = OKXExecution(
+            max_risk_pct=self.max_risk_pct,
+            max_capital_pct=self.max_capital_pct,
+            max_contracts=self.max_contracts,
+            leverage=self.leverage,
+        )
 
-        # 在线 K 线矩阵
+        # 在线数据
         self._data: dict[str, pd.DataFrame] = {}
         self._last_bar_ts: dict[str, int] = {}
         self._position_entry_bar: dict[str, int] = {}
@@ -54,6 +79,19 @@ class LiveRunner:
         self._running = False
         self._trade_log = []
 
+        # ---- 风险监控 ----
+        self._day_start_equity = None          # 今日初始权益
+        self._peak_equity = 0.0                # 周期内峰值权益
+        self._circuit_breaker = {
+            "daily_paused": False,             # 当日熔断暂停
+            "reduced_mode": False,             # 降为1张模式
+            "stopped": False,                  # 完全停止
+            "reason": "",                      # 熔断原因
+        }
+
+    # ------------------------------------------------------------
+    # 行情获取
+    # ------------------------------------------------------------
     def fetch_recent_candles(self, timeframe: str, limit=500) -> pd.DataFrame | None:
         url = "https://www.okx.com/api/v5/market/history-candles"
         bar_map = {"15m": "15m", "2h": "2H"}
@@ -65,21 +103,98 @@ class LiveRunner:
         rows = []
         for c in data["data"]:
             ts = int(c[0])
-            rows.append({"timestamp": ts, "open": float(c[1]), "high": float(c[2]), "low": float(c[3]), "close": float(c[4]), "volume": float(c[5])})
+            rows.append({"timestamp": ts, "open": float(c[1]), "high": float(c[2]),
+                         "low": float(c[3]), "close": float(c[4]), "volume": float(c[5])})
         df = pd.DataFrame(rows)
         df.sort_values("timestamp", inplace=True)
         df.reset_index(drop=True, inplace=True)
         return df
 
+    # ------------------------------------------------------------
+    # 风险监控
+    # ------------------------------------------------------------
+    def _check_circuit_breakers(self, equity: float) -> bool:
+        """检查熔断条件，返回 True = 允许继续交易"""
+        now = datetime.now(timezone.utc)
+
+        # 每日起始权益
+        if self._day_start_equity is None:
+            self._day_start_equity = equity
+        elif now.hour == 0 and now.minute < 5:
+            self._day_start_equity = equity
+            self._circuit_breaker["daily_paused"] = False
+
+        # 更新峰值权益
+        if equity > self._peak_equity:
+            self._peak_equity = equity
+
+        # 当日亏损
+        day_pnl_pct = (equity - self._day_start_equity) / self._day_start_equity * 100
+        if day_pnl_pct <= -DAILY_DD_LIMIT and not self._circuit_breaker["daily_paused"]:
+            self._circuit_breaker["daily_paused"] = True
+            self._circuit_breaker["reason"] = "daily_dd"
+            msg = "DAILY DD > {}% — paused until UTC 00:00. equity=${:.0f} day_start=${:.0f}".format(
+                DAILY_DD_LIMIT, equity, self._day_start_equity)
+            logger.warning(msg)
+            self._safe_close_position("Daily DD limit hit")
+
+        # 累计亏损
+        total_dd_pct = (equity - self.capital) / self.capital * 100
+        if total_dd_pct <= -CUMULATIVE_DD_STOP and not self._circuit_breaker["stopped"]:
+            self._circuit_breaker["stopped"] = True
+            self._circuit_breaker["reason"] = "total_dd"
+            msg = "TOTAL DD > {}% — STOPPED. equity=${:.0f} initial=${:.0f}".format(
+                CUMULATIVE_DD_STOP, equity, self.capital)
+            logger.error(msg)
+            self._safe_close_position("Total DD stop")
+            return False
+
+        if total_dd_pct <= -CUMULATIVE_DD_REDUCE and not self._circuit_breaker["reduced_mode"]:
+            self._circuit_breaker["reduced_mode"] = True
+            self._circuit_breaker["reason"] = "total_dd_reduce"
+            msg = "TOTAL DD > {}% — reduced to 1 contract mode. equity=${:.0f}".format(
+                CUMULATIVE_DD_REDUCE, equity)
+            logger.warning(msg)
+            self._safe_close_position("Total DD reduction")
+
+        return not self._circuit_breaker["stopped"]
+
+    def _safe_close_position(self, reason: str):
+        """安全平仓——不因网络异常中断熔断流程"""
+        try:
+            pos = self.executor.get_position()
+            if pos:
+                self.executor.close_position()
+                logger.info("Circuit breaker: position closed ({})".format(reason))
+        except Exception as e:
+            logger.error("Circuit breaker: close_position failed ({}) — will retry: {}".format(reason, e))
+
+    def _effective_max_contracts(self) -> float:
+        """返回当前生效的单笔最大合约数"""
+        if self._circuit_breaker["reduced_mode"]:
+            return 1.0
+        return self.max_contracts
+
+    # ------------------------------------------------------------
+    # K 线处理
+    # ------------------------------------------------------------
     def process_new_bar(self, timeframe: str, bar_index: int):
-        """处理新闭合 K 线：检测背离信号并执行交易"""
         df = self._data.get(timeframe)
         warmup = 80 if timeframe == "15m" else 40
         if df is None or len(df) < warmup:
             return
 
+        # 先检查熔断
+        bal = self.executor.get_balance()
+        equity = bal["total_equity"]
+        if not self._check_circuit_breakers(equity):
+            return
+
+        # 每次开仓前重设 max_contracts（熔断模式下可能为1）
+        effective_mc = self._effective_max_contracts()
+        self.executor.max_contracts = effective_mc
+
         detector = self.short_detector if timeframe == "15m" else self.long_detector
-        sl_updater = self.short_sl_updater if timeframe == "15m" else self.long_sl_updater
         direction = Direction.SHORT if timeframe == "15m" else Direction.LONG
 
         signals = detector.detect(df.iloc[:bar_index + 1], timeframe)
@@ -88,7 +203,6 @@ class LiveRunner:
         bar_ts = int(bar["timestamp"])
         bar_close = float(bar["close"])
         bar_high = float(bar["high"])
-        bar_low = float(bar["low"])
 
         for sig in signals:
             log_entry = {
@@ -96,26 +210,26 @@ class LiveRunner:
                 "bar_close": bar_close, "signal_type": sig.signal_type.value,
                 "divergence_type": sig.divergence_type.value if sig.divergence_type else "",
                 "price": sig.price, "rsi": sig.rsi_value, "atr": sig.atr_value,
+                "circuit_breaker": self._circuit_breaker["reason"] if self._circuit_breaker.get("daily_paused") or self._circuit_breaker.get("reduced_mode") else "",
             }
 
             if direction == Direction.SHORT and sig.signal_type == SignalType.SELL:
-                sl_price = sig.trailing_sl or (bar_high + SHORT_PARAMS.stop_loss_mult * (sig.atr_value or 500))
-                ok, msg, srep = self.executor.open_short(sl_price)
-                log_entry["action"] = "OPEN_SHORT"
-                log_entry["sl_price"] = sl_price
-                log_entry["result"] = "OK" if ok else "FAIL"
-                log_entry["message"] = msg
-                log_entry["sizing"] = srep
-                if ok:
-                    self._position_entry_bar["15m"] = bar_index
-                logger.info("SELL: {} | {}".format(msg, "OPENED" if ok else "BLOCKED"))
-
-            elif direction == Direction.LONG and sig.signal_type == SignalType.BUY:
-                # 多单开仓（暂用 close_position 取反做 demo，实盘应调用 open_long）
-                logger.info("LONG signal — manual check required: BUY @ {:.0f} SL={:.0f}".format(bar_close, sig.trailing_sl or 0))
-                log_entry["action"] = "OPEN_LONG"
-                log_entry["result"] = "SIGNAL_ONLY"
-                log_entry["message"] = "LONG signal detected"
+                if self._circuit_breaker["daily_paused"] or self._circuit_breaker["stopped"]:
+                    logger.info("SELL blocked by circuit breaker: {}".format(self._circuit_breaker["reason"]))
+                    log_entry["action"] = "OPEN_SHORT"
+                    log_entry["result"] = "BLOCKED"
+                    log_entry["message"] = "circuit_breaker: {}".format(self._circuit_breaker["reason"])
+                else:
+                    sl_price = sig.trailing_sl or (bar_high + SHORT_PARAMS.stop_loss_mult * (sig.atr_value or 500))
+                    ok, msg, srep = self.executor.open_short(sl_price)
+                    log_entry["action"] = "OPEN_SHORT"
+                    log_entry["sl_price"] = sl_price
+                    log_entry["result"] = "OK" if ok else "FAIL"
+                    log_entry["message"] = msg
+                    log_entry["sizing"] = srep
+                    if ok:
+                        self._position_entry_bar["15m"] = bar_index
+                    logger.info("SELL: {} | {} (mc={})".format(msg, "OPENED" if ok else "BLOCKED", effective_mc))
 
             elif sig.signal_type == SignalType.CLOSE_SHORT:
                 ok, msg = self.executor.close_position()
@@ -137,14 +251,26 @@ class LiveRunner:
 
             self._trade_log.append(log_entry)
 
+    # ------------------------------------------------------------
+    # 主循环
+    # ------------------------------------------------------------
     def run(self, max_duration_hours=None):
         self._running = True
         start_time = time.time()
-        logger.info("LIVE RUNNER STARTED capital={} leverage={}x".format(self.capital, self.leverage))
+        logger.info("=" * 50)
+        logger.info("LIVE RUNNER — 500U / 5x / Aggressive")
+        logger.info("  capital={} leverage={}x".format(self.capital, self.leverage))
+        logger.info("  max_contracts={} risk_pct={}% cap_pct={}%".format(
+            self.max_contracts, self.max_risk_pct, self.max_capital_pct))
+        logger.info("  Circuit breakers: daily_dd>{}%  reduce>{}%  stop>{}%".format(
+            DAILY_DD_LIMIT, CUMULATIVE_DD_REDUCE, CUMULATIVE_DD_STOP))
+        logger.info("=" * 50)
+
         bal = self.executor.get_balance()
+        self._peak_equity = bal["total_equity"]
         logger.info("Account: equity=${:.2f} free=${:.2f}".format(bal["total_equity"], bal["free"]))
 
-        # 初始化两个 timeframes 的 K 线数据
+        # 初始化 K 线
         for tf in TIMEFRAMES:
             limit = CANDLE_LIMITS.get(tf, 500)
             df = self.fetch_recent_candles(tf, limit=limit)
@@ -160,6 +286,9 @@ class LiveRunner:
         while self._running:
             iteration += 1
             if max_duration_hours and (time.time() - start_time) > max_duration_hours * 3600:
+                break
+            if self._circuit_breaker["stopped"]:
+                logger.error("STOPPED by circuit breaker — exiting")
                 break
 
             try:
@@ -187,9 +316,17 @@ class LiveRunner:
                 if iteration % 10 == 0:
                     pos = self.executor.get_position()
                     bal = self.executor.get_balance()
-                    logger.info("Status: POS={} BAL=${:.2f}".format(
+                    eq = bal["total_equity"]
+                    day_pnl = (eq - (self._day_start_equity or eq)) / (self._day_start_equity or eq) * 100
+                    total_pnl = (eq - self.capital) / self.capital * 100
+                    cb_status = ""
+                    if self._circuit_breaker["daily_paused"]:
+                        cb_status = " [DAILY_PAUSED]"
+                    elif self._circuit_breaker["reduced_mode"]:
+                        cb_status = " [REDUCED-1CT]"
+                    logger.info("Status: POS={} EQUITY=${:.0f} day={:+.1f}% total={:+.1f}%{}".format(
                         "{} {}ct".format(pos["side"], pos["contracts"]) if pos else "NONE",
-                        bal["total_equity"]))
+                        eq, day_pnl, total_pnl, cb_status))
 
             except Exception as e:
                 logger.error("Iter {} error: {}".format(iteration, e))
@@ -210,13 +347,15 @@ class LiveRunner:
         logger.info("Log: {}".format(log_path))
         self.executor.close()
 
+
 def main():
-    runner = LiveRunner(capital=50.0, leverage=2, max_risk_pct=15.0, max_capital_pct=70.0, max_contracts=5)
+    runner = LiveRunner()
     try:
         runner.run()
     except KeyboardInterrupt:
         logger.info("KeyboardInterrupt")
         runner.shutdown()
+
 
 if __name__ == "__main__":
     main()
