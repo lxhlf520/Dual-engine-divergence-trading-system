@@ -172,7 +172,7 @@ class LiveRunner:
     def _effective_max_contracts(self) -> float:
         """返回当前生效的单笔最大合约数"""
         if self._circuit_breaker["reduced_mode"]:
-            return 1.0
+            return min(self.max_contracts, 2.0)  # 缩仓模式保留一半
         return self.max_contracts
 
     # ------------------------------------------------------------

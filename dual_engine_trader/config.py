@@ -39,17 +39,17 @@ LB_R = 2
 DEFAULT_LEVERAGE = 5
 MARGIN_MODE = "cross"
 
-# --- Live trading defaults (500U / 5x / 风控优先) ---
+# --- Live trading defaults (500U / 5x / 积极) ---
 LIVE_CAPITAL = 500.0
-LIVE_MAX_RISK_PCT = 20.0         # 单笔最大风险上限（单笔实际仅0.75%，留buffer）
-LIVE_MAX_CAPITAL_PCT = 50.0      # 最多用50%资金开仓（5x下仅需24%，余留充足buffer）
-LIVE_MAX_CONTRACTS = 1           # 单笔1张（pyramiding后最多2张）
-LIVE_PYRAMIDING = 2              # 最多加仓1次
+LIVE_MAX_RISK_PCT = 30.0         # 单笔风险上限（实际3%，留足够容错）
+LIVE_MAX_CAPITAL_PCT = 96.0      # 最多96%开仓（4张×$120=$480）
+LIVE_MAX_CONTRACTS = 4           # 单笔4张
+LIVE_PYRAMIDING = 2              # 最多加仓1次（但保证金会自限）
 
 # --- 安全熔断 ---
-DAILY_DD_LIMIT = 5.0             # 当日回撤 >5%（-$25）→ 暂停当天
-CUMULATIVE_DD_REDUCE = 15.0      # 累计回撤 >15%（-$75）→ 不再加仓
-CUMULATIVE_DD_STOP = 25.0        # 累计回撤 >25%（-$125）→ 全平停止
+DAILY_DD_LIMIT = 5.0             # 日亏 >5%（-$25）→ 暂停当天
+CUMULATIVE_DD_REDUCE = 15.0      # 累计亏 >15%（-$75）→ 降为2张
+CUMULATIVE_DD_STOP = 25.0        # 累计亏 >25%（-$125）→ 全平停止
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 DINGTALK_WEBHOOK = os.getenv("DINGTALK_WEBHOOK", "")
