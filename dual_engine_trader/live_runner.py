@@ -2,6 +2,7 @@ import sys, warnings, os, json, time, threading
 from pathlib import Path
 from datetime import datetime, timezone, date
 from collections import defaultdict
+from typing import Optional, Dict
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -72,9 +73,9 @@ class LiveRunner:
         )
 
         # 在线数据
-        self._data: dict[str, pd.DataFrame] = {}
-        self._last_bar_ts: dict[str, int] = {}
-        self._position_entry_bar: dict[str, int] = {}
+        self._data: Dict[str, pd.DataFrame] = {}
+        self._last_bar_ts: Dict[str, int] = {}
+        self._position_entry_bar: Dict[str, int] = {}
 
         self._running = False
         self._trade_log = []
@@ -92,7 +93,7 @@ class LiveRunner:
     # ------------------------------------------------------------
     # 行情获取
     # ------------------------------------------------------------
-    def fetch_recent_candles(self, timeframe: str, limit=500) -> pd.DataFrame | None:
+    def fetch_recent_candles(self, timeframe: str, limit=500) -> Optional[pd.DataFrame]:
         url = "https://www.okx.com/api/v5/market/history-candles"
         bar_map = {"15m": "15m", "2h": "2H"}
         params = {"instId": INST_ID, "bar": bar_map.get(timeframe, timeframe), "limit": str(limit)}
@@ -197,7 +198,25 @@ class LiveRunner:
         detector = self.short_detector if timeframe == "15m" else self.long_detector
         direction = Direction.SHORT if timeframe == "15m" else Direction.LONG
 
+        # 实盘只使用 15M 做空信号（2H 引擎暂不参与实盘）
+        if timeframe == "2h":
+            return
+
         signals = detector.detect(df.iloc[:bar_index + 1], timeframe)
+        # 只处理当前 bar 产生的信号，避免重复执行历史信号
+        current_signals = []
+        for sig in signals:
+            meta = sig.metadata
+            pivot_idx = meta.get("pivot_b") if sig.signal_type in (SignalType.BUY, SignalType.SELL) else None
+            if pivot_idx is not None:
+                if pivot_idx == bar_index:
+                    current_signals.append(sig)
+            elif sig.signal_type == SignalType.CLOSE_SHORT:
+                ts_diff = abs(int(sig.timestamp) - int(bar_ts))
+                if ts_diff <= 900000:  # 15分钟窗口
+                    current_signals.append(sig)
+        signals = current_signals
+
         now = datetime.now(timezone.utc)
         bar = df.iloc[bar_index]
         bar_ts = int(bar["timestamp"])
